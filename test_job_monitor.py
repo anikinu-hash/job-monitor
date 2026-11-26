@@ -16,4 +16,21 @@ class Tests(unittest.TestCase):
     def test_outside(self): self.v['work']='Объект в Тульской области'; self.assertIsNone(classify(self.v,self.now)[0])
     def test_town_only(self): self.v['address']=''; self.assertIsNone(classify(self.v,self.now)[0])
     def test_bad_town(self): self.v['town']={'title':'Казань'}; self.assertIsNone(classify(self.v,self.now)[0])
+    def test_preliminary_missing(self):
+        from job_monitor import preliminary
+        self.assertIsNone(preliminary({},self.now))
+    def test_preliminary_rotation(self):
+        from job_monitor import preliminary
+        self.assertEqual(preliminary({'type_of_work':{'title':'Вахта'}},self.now),'rotation')
+    def test_region_query(self):
+        from unittest.mock import patch
+        from job_monitor import search
+        with patch('job_monitor.api',side_effect=[{'objects':[{'id':4,'title':'Московская область'}]}]+[{'objects':[],'more':False}]*5) as m:
+            self.assertEqual(search(),{})
+            self.assertEqual(m.call_args_list[1].args[1]['o[]'],[4])
+    def test_missing_region(self):
+        from unittest.mock import patch
+        from job_monitor import regions
+        with patch('job_monitor.api',return_value={'objects':[]}):
+            with self.assertRaises(RuntimeError): regions()
 if __name__=='__main__': unittest.main()
