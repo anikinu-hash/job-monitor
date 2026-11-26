@@ -25,10 +25,10 @@ class Tests(unittest.TestCase):
     def test_region_query(self):
         from unittest.mock import patch
         from job_monitor import search
-        with patch('job_monitor.api',side_effect=[{'objects':[{'id':46,'title':'Московская область','id_country':1}]},{'objects':[{'id':4,'title':'Москва','id_country':1}]}]+[{'objects':[],'more':False}]*10) as m:
+        with patch('job_monitor.api',side_effect=[{'objects':[{'id':46,'title':'Московская область','id_country':1}]},{'objects':[{'id':4,'title':'Москва','id_country':1}]}]+[{'objects':[],'more':False}]*20) as m:
             self.assertEqual(search(),{})
             self.assertEqual(m.call_args_list[2].args[1]['town'],4)
-            self.assertEqual(m.call_args_list[7].args[1]['o[0]'],46)
+            self.assertEqual(m.call_args_list[12].args[1]['o[0]'],46)
     def test_duties(self):
         self.v['profession']='Инженер строительного контроля'; self.v['work']='Геодезический контроль на объекте в Москве'; self.assertIsNotNone(classify(self.v,self.now)[0])
     def test_rotation_id(self):
@@ -42,4 +42,26 @@ class Tests(unittest.TestCase):
         from job_monitor import regions
         with patch('job_monitor.api',return_value={'objects':[]}):
             with self.assertRaises(RuntimeError): regions()
+    def test_multiple_reasons(self):
+        from job_monitor import evaluate
+        self.v.update(profession='Менеджер',work='Вахта',town={'title':'Казань'})
+        _, reasons, _=evaluate(self.v,self.now)
+        self.assertTrue({'rotation','irrelevant','town unconfirmed','worksite unconfirmed'}.issubset(reasons))
+    def test_requirements(self):
+        from job_monitor import relevant
+        self.assertTrue(relevant({'profession':'Инженер','candidat':'Опыт геодезических работ'}))
+    def test_report(self):
+        from unittest.mock import patch
+        from job_monitor import main
+        import tempfile, os, json
+        from pathlib import Path
+        old=os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                os.chdir(d)
+                with patch('job_monitor.search',return_value={'1':self.v}),patch('job_monitor.api',return_value=self.v): main()
+                r=json.loads(Path('private-report/diagnostic.json').read_text())['records'][0]
+                self.assertEqual(r['status'],'api_candidate')
+                self.assertEqual(r['summary']['profession'],self.v['profession'])
+            finally: os.chdir(old)
 if __name__=='__main__': unittest.main()

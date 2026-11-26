@@ -8,7 +8,7 @@ from email.message import EmailMessage
 from html import escape
 
 API='https://api.superjob.ru/2.0/'
-QUERIES=('геодезист','геодезический контроль','лазерное сканирование','облака точек','геодезия')
+QUERIES=('геодезист','геодезический контроль','лазерное сканирование','облака точек','геодезия','главный геодезист','ведущий геодезист','технический заказчик','строительный контроль','главный специалист по геодезии')
 MAX_AGE=7*86400
 LIMIT=20
 ROTATION=re.compile(r'вахт|межвахт',re.I)
@@ -22,7 +22,7 @@ def field(v,k):
     return str(x.get('title','') if isinstance(x,dict) else x)
 
 def api(path,params=None):
-    req=Request(API+path+('?' + urlencode(params,doseq=True) if params else ''),headers={'X-Api-App-Id':os.environ['SUPERJOB_API_KEY'],'Accept':'application/json','User-Agent':'JobMonitor/1.3'})
+    req=Request(API+path+('?' + urlencode(params,doseq=True) if params else ''),headers={'X-Api-App-Id':os.environ['SUPERJOB_API_KEY'],'Accept':'application/json','User-Agent':'JobMonitor/1.4'})
     for attempt in range(3):
         try:
             with urlopen(req,timeout=30) as r: return json.load(r)
@@ -30,36 +30,45 @@ def api(path,params=None):
             if e.code not in (429,500,502,503,504) or attempt==2: raise RuntimeError(f'API HTTP {e.code}') from None
         time.sleep(2**attempt)
 
-def classify(v,now):
-    title=field(v,'profession'); duties=field(v,'work'); req=field(v,'candidat'); terms=field(v,'compensation'); schedule=field(v,'type_of_work'); town=field(v,'town'); address=field(v,'address'); body=' '.join((title,duties,req,terms,schedule,address))
-    if str((v.get('type_of_work') or {}).get('id','') if isinstance(v.get('type_of_work'),dict) else '')=='9' or ROTATION.search(NEG_ROTATION.sub('',body)): return None,'rotation'
-    if v.get('is_archive') or v.get('archive') or v.get('is_closed'): return None,'closed'
+def evaluate(v, now):
+    title=field(v,'profession'); duties=field(v,'work'); req=field(v,'candidat'); terms=field(v,'compensation'); schedule=field(v,'type_of_work'); town=field(v,'town'); address=field(v,'address')
+    body=' '.join((title,duties,req,terms,schedule,address,field(v,'description')))
+    reasons=[]
+    if str((v.get('type_of_work') or {}).get('id','') if isinstance(v.get('type_of_work'),dict) else '')=='9' or ROTATION.search(NEG_ROTATION.sub('',body)): reasons.append('rotation')
+    if v.get('is_archive') or v.get('archive') or v.get('is_closed'): reasons.append('closed')
     try: age=now-int(v['date_published'])
-    except (KeyError,ValueError,TypeError): return None,'date'
-    if not 0<=age<=MAX_AGE: return None,'date'
-    # Conservative: city alone is not proof of actual worksite.
-    if OUTSIDE.search(body+' '+town): return None,'outside or ambiguous region'
-    if not REGION.search(town): return None,'town unconfirmed'
-    if not REGION.search(duties+' '+terms): return None,'worksite unconfirmed'
-    if OTHER.search(body): return None,'travel unconfirmed'
-    if not re.search(r'полный (?:рабочий )?день|5\s*[/–-]\s*2|пятиднев|без вахты',schedule+' '+terms,re.I): return None,'schedule unconfirmed'
-    if not relevant(v): return None,'irrelevant'
+    except (KeyError,ValueError,TypeError): age=-1
+    if not 0<=age<=MAX_AGE: reasons.append('date')
+    if not relevant(v): reasons.append('irrelevant')
+    if OUTSIDE.search(body+' '+town): reasons.append('outside or ambiguous region')
+    if not REGION.search(town): reasons.append('town unconfirmed')
+    # A company address or search city alone is not worksite evidence.
+    site_text=' '.join((duties,terms,field(v,'description')))
+    site_pattern=r'(?:место работы|работа на объекте|на объекте в|работа в|объект находится|объект расположен|объект в|адрес объекта|работа на территории)'
+    evidence=[x for x in re.split(r'[\n;.!?]',site_text) if re.search(site_pattern,x,re.I) and REGION.search(x)]
+    if not evidence: reasons.append('worksite unconfirmed')
+    if OTHER.search(body): reasons.append('travel unconfirmed')
+    if not re.search(r'полный (?:рабочий )?день|5\s*[/–-]\s*2|пятиднев|без вахты',schedule+' '+terms,re.I): reasons.append('schedule unconfirmed')
     if re.search(r'главн\w* геодезист|руководител\w* геодез',title,re.I): rank=1
     elif re.search(r'техническ\w* заказчик|техзаказчик',title+' '+duties,re.I): rank=2
     elif re.search(r'ведущ|главн|контрол',title,re.I): rank=3
     elif re.search(r'сканирован|облак',title,re.I): rank=4
     else: rank=5
-    link=field(v,'link'); u=urlsplit(link)
-    if u.scheme!='https' or not (u.hostname=='superjob.ru' or (u.hostname or '').endswith('.superjob.ru')): return None,'link'
-    if not v.get('id'): return None,'id'
-    return rank,'ok'
+    u=urlsplit(field(v,'link'))
+    if u.scheme!='https' or not (u.hostname=='superjob.ru' or (u.hostname or '').endswith('.superjob.ru')): reasons.append('link')
+    if not v.get('id'): reasons.append('id')
+    return rank,reasons,evidence
+
+def classify(v,now):
+    rank,reasons,_=evaluate(v,now)
+    return (None,reasons[0]) if reasons else (rank,'ok')
 
 def fingerprint(v):
     def norm(s): return re.sub(r'\W+','',s.casefold())
     return hashlib.sha256('|'.join(norm(field(v,k)) for k in ('firm_name','profession','town','address')).encode()).hexdigest()
 
 def relevant(v):
-    title=field(v,'profession'); work=field(v,'work')
+    title=field(v,'profession'); work=' '.join(field(v,k) for k in ('work','candidat','description','compensation'))
     pattern=r'геодез|лазерн\w*\s+сканирован|облак\w*\s+точек'
     return bool(re.search(pattern,title+' '+work,re.I))
 
@@ -113,51 +122,38 @@ def send(html):
         smtp.login(os.environ['MAIL_USER'],os.environ['MAIL_APP_PASSWORD']); smtp.send_message(msg)
 
 def main():
-    state=Path(os.environ.get('STATE_FILE','history.json')); seen=json.loads(state.read_text()) if state.exists() else {'ids':[],'fingerprints':[]}; ids=set(seen['ids']); fps=set(seen['fingerprints']); counts={}; candidates=[]; review=[]; now=time.time()
     from collections import Counter
-    diagnostic_titles=Counter()
-    stats={'search_rows':0,'detail_rows':0,'town_present':0,'address_present':0,'local_town':0,'local_address':0,'schedule_present':0,'town_region_match':0,'local_town_without_local_address':0}
+    now=time.time(); counts=Counter(); records=[]
+    fields=('id','profession','work','candidat','compensation','description','town','address','type_of_work','firm_name','date_published','link','payment_from','payment_to','currency','is_archive','is_closed')
+    def snapshot(v):
+        return {k:v[k] for k in fields if k in v}
     for ident,summary in search().items():
-        stats['search_rows']+=1
-        if ident in ids: continue
-        reason=preliminary(summary,now)
-        if reason:
-            counts[reason]=counts.get(reason,0)+1; continue
         try: v=api('vacancies/'+ident+'/')
         except RuntimeError as e:
             if str(e) in ('API HTTP 404','API HTTP 410'):
-                counts['closed']=counts.get('closed',0)+1; continue
+                counts['closed']+=1; continue
             raise
         if str(v.get('id'))!=ident: raise RuntimeError('Unexpected detail ID')
-        stats['detail_rows']+=1
-        from collections import Counter
-        diagnostic_titles[field(v,'profession') or '(missing)'] += 1
-        town=field(v,'town'); address=field(v,'address')
-        for k,flag in [('town_present',bool(town)),('address_present',bool(address)),('local_town',bool(REGION.search(town))),('local_address',bool(REGION.search(address))),('schedule_present',bool(field(v,'type_of_work'))),('town_region_match',bool(REGION.search(field(v,'town')))),('local_town_without_local_address',bool(REGION.search(town)) and not bool(REGION.search(address)))]:
-            stats[k]+=int(flag)
-        rank,reason=classify(v,now)
-        if rank is None:
-            counts[reason]=counts.get(reason,0)+1
-            if reason in ('town unconfirmed','worksite unconfirmed','outside or ambiguous region','schedule unconfirmed','travel unconfirmed'):
-                review.append((ident,reason))
-            continue
-        candidates.append((rank,-int(v['date_published']),ident,v))
-    selected=[]
-    for _,_,ident,v in sorted(candidates):
-        if len(selected)>=LIMIT: break
-        fp=fingerprint(v)
-        if fp in fps: continue
-        selected.append(v); ids.add(ident); fps.add(fp)
-    print('Distinct titles:',len(diagnostic_titles),'title matches:',sum(n for t,n in diagnostic_titles.items() if relevant({'profession':t})))
-    print('Diagnostics:',json.dumps(stats,ensure_ascii=False))
-    print('Needs manual review (count only):',len(review))
-    print('Exclusions:',json.dumps(counts,ensure_ascii=False))
-    html=report(selected,counts)
-    if os.environ.get('SEND_MAIL')!='1':
-        print('Dry run: selected',len(selected),'exclusions',counts); return
-    raise RuntimeError('Version 1.3 diagnostic only: email disabled')
-    send(html)
-    state.parent.mkdir(parents=True,exist_ok=True); tmp=state.with_suffix('.tmp'); tmp.write_text(json.dumps({'ids':sorted(ids),'fingerprints':sorted(fps)})); tmp.replace(state)
-    print('Report sent; count:',len(selected))
+        rank,reasons,evidence=evaluate(v,now)
+        counts.update(reasons)
+        hard={'rotation','closed','date','irrelevant','id','link'}
+        status='excluded' if hard.intersection(reasons) else ('review' if reasons else 'api_candidate')
+        records.append(dict(id=ident,rank=rank,status=status,reasons=reasons,worksite_evidence=evidence,summary=snapshot(summary),detail=snapshot(v),summary_keys=sorted(summary),detail_keys=sorted(v)))
+    records.sort(key=lambda r:(r['status']!='api_candidate',r['rank'],r['id']))
+    stats=Counter(r['status'] for r in records)
+    out=Path('private-report'); out.mkdir(exist_ok=True)
+    (out/'diagnostic.json').write_text(json.dumps({'version':'1.4','counts':dict(counts),'records':records},ensure_ascii=False,indent=2),encoding='utf-8')
+    html=['<!doctype html><html lang="ru"><meta charset="utf-8"><h1>Job Monitor 1.4</h1><p>Кандидаты API не являются подтвержденными: доступность отклика не проверена. Причины могут пересекаться.</p>']
+    for status,label in [('api_candidate','Кандидаты API (до 20)'),('review','Ручная проверка'),('excluded','Исключенные')]:
+        html.append('<h2>'+label+'</h2><table border="1"><tr><th>Компания / должность</th><th>Город / адрес компании</th><th>График</th><th>Причины / признаки</th><th>Требования / обязанности</th><th>Ссылка</th></tr>')
+        group=[r for r in records if r['status']==status]
+        for r in (group[:20] if status=='api_candidate' else group):
+            v=r['detail']; cells=[field(v,'firm_name')+' / '+field(v,'profession'),field(v,'town')+' / '+field(v,'address'),field(v,'type_of_work'),'; '.join(r['reasons']+r['worksite_evidence']),field(v,'candidat')+' / '+field(v,'work')]
+            link=field(v,'link'); u=urlsplit(link); safe=u.scheme=='https' and (u.hostname=='superjob.ru' or (u.hostname or '').endswith('.superjob.ru'))
+            html.append('<tr>'+''.join('<td>'+escape(c)+'</td>' for c in cells)+'<td>'+('<a href="'+escape(link,quote=True)+'">Открыть</a>' if safe else '—')+'</td></tr>')
+        html.append('</table>')
+    (out/'report.html').write_text(''.join(html)+'</html>',encoding='utf-8')
+    print('Version 1.4; detail rows:',len(records),'statuses:',dict(stats),'reasons:',dict(counts))
+    print('Confirmed website applications: 0 (not checked)')
 
 if __name__=='__main__': main()
