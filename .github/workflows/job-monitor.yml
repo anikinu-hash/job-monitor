@@ -1,8 +1,6 @@
 name: Job Monitor
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 10 * * *'
 permissions:
   contents: read
 concurrency:
@@ -11,14 +9,14 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Tests
         run: python3 -m unittest -v
       - name: Get private history repository
         if: vars.SEND_MAIL == '1'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: anikinu-hash/job-monitor-state
           token: ${{ secrets.STATE_TOKEN }}
