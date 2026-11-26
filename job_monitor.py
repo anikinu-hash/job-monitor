@@ -12,7 +12,9 @@ QUERIES=('геодезист','геодезический контроль','л�
 MAX_AGE=7*86400
 LIMIT=20
 ROTATION=re.compile(r'вахт|межвахт',re.I)
-REGION=re.compile(r'москва|московская область|подмосковье',re.I)
+REGION=re.compile(r'\bмоскв[аеуы]|московск\w*\s+област|подмосковь|\b(?:химки|балашиха|мытищи|красногорск|одинцово|люберцы|подольск|домодедово|реутов|долгопрудный|лобня|видное|котельники|пушкино|корол[её]в|щ[её]лково|электросталь|раменское|жуковский|истра|чехов|серпухов|дмитров|клин|солнечногорск|ногинск|коломна|воскресенск|ступино|наро-фоминск|сергиев посад|орехово-зуево)\b',re.I)
+NEG_ROTATION=re.compile(r'без\s+вахт\w*|не\s+вахт\w*|вахт\w*\s+не\s+предусмотрен\w*',re.I)
+OUTSIDE=re.compile(r'санкт-петербург|ленинградск\w*\s+област|тульск\w*\s+област|калужск\w*\s+област|тверск\w*\s+област|рязанск\w*\s+област|сахалин|якут|краснояр|сибир|хмао|янао|новосибирск|екатеринбург',re.I)
 OTHER=re.compile(r'командиров|разъезд|объект[ыа]? по россии',re.I)
 
 def field(v,k):
@@ -20,7 +22,7 @@ def field(v,k):
     return str(x.get('title','') if isinstance(x,dict) else x)
 
 def api(path,params=None):
-    req=Request(API+path+('?' + urlencode(params,doseq=True) if params else ''),headers={'X-Api-App-Id':os.environ['SUPERJOB_API_KEY'],'Accept':'application/json','User-Agent':'JobMonitor/1.0'})
+    req=Request(API+path+('?' + urlencode(params,doseq=True) if params else ''),headers={'X-Api-App-Id':os.environ['SUPERJOB_API_KEY'],'Accept':'application/json','User-Agent':'JobMonitor/1.1'})
     for attempt in range(3):
         try:
             with urlopen(req,timeout=30) as r: return json.load(r)
@@ -30,13 +32,16 @@ def api(path,params=None):
 
 def classify(v,now):
     title=field(v,'profession'); duties=field(v,'work'); req=field(v,'candidat'); terms=field(v,'compensation'); schedule=field(v,'type_of_work'); town=field(v,'town'); address=field(v,'address'); body=' '.join((title,duties,req,terms,schedule,address))
-    if ROTATION.search(body): return None,'rotation'
+    if ROTATION.search(NEG_ROTATION.sub('',body)): return None,'rotation'
     if v.get('is_archive') or v.get('archive') or v.get('is_closed'): return None,'closed'
     try: age=now-int(v['date_published'])
     except (KeyError,ValueError,TypeError): return None,'date'
     if not 0<=age<=MAX_AGE: return None,'date'
     # Conservative: city alone is not proof of actual worksite.
+    if OUTSIDE.search(body+' '+town): return None,'outside or ambiguous region'
+    if not REGION.search(town): return None,'town unconfirmed'
     if not REGION.search(address+' '+duties+' '+terms): return None,'worksite unconfirmed'
+    if address and not REGION.search(address) and not REGION.search(duties+' '+terms): return None,'worksite unconfirmed'
     if OTHER.search(body): return None,'travel unconfirmed'
     if not re.search(r'полный рабочий день|5\s*[/–-]\s*2|пятиднев|без вахты',schedule+' '+terms,re.I): return None,'schedule unconfirmed'
     if not re.search(r'геодез|лазерн.*сканирован|облак[ао] точек',title,re.I): return None,'irrelevant'
@@ -84,23 +89,31 @@ def send(html):
 
 def main():
     state=Path(os.environ.get('STATE_FILE','history.json')); seen=json.loads(state.read_text()) if state.exists() else {'ids':[],'fingerprints':[]}; ids=set(seen['ids']); fps=set(seen['fingerprints']); counts={}; candidates=[]; now=time.time()
-    for ident,v in search().items():
+    stats={'search_rows':0,'detail_rows':0,'town_present':0,'address_present':0,'local_town':0,'local_address':0,'schedule_present':0,'town_region_match':0,'local_town_without_local_address':0}
+    for ident,summary in search().items():
+        stats['search_rows']+=1
         if ident in ids: continue
-        rank,reason=classify(v,now)
-        if rank is None: counts[reason]=counts.get(reason,0)+1; continue
-        candidates.append((rank,-int(v['date_published']),ident))
-    selected=[]
-    for _,_,ident in sorted(candidates):
-        if len(selected)>=LIMIT: break
         try: v=api('vacancies/'+ident+'/')
         except RuntimeError as e:
-            if str(e)=='API HTTP 404': continue
+            if str(e)=='API HTTP 404':
+                counts['closed']=counts.get('closed',0)+1; continue
             raise
+        if str(v.get('id'))!=ident: raise RuntimeError('Unexpected detail ID')
+        stats['detail_rows']+=1
+        town=field(v,'town'); address=field(v,'address')
+        for k,flag in [('town_present',bool(town)),('address_present',bool(address)),('local_town',bool(REGION.search(town))),('local_address',bool(REGION.search(address))),('schedule_present',bool(field(v,'type_of_work'))),('town_region_match',bool(REGION.search(field(v,'town')))),('local_town_without_local_address',bool(REGION.search(town)) and not bool(REGION.search(address)))]:
+            stats[k]+=int(flag)
         rank,reason=classify(v,now)
         if rank is None: counts[reason]=counts.get(reason,0)+1; continue
+        candidates.append((rank,-int(v['date_published']),ident,v))
+    selected=[]
+    for _,_,ident,v in sorted(candidates):
+        if len(selected)>=LIMIT: break
         fp=fingerprint(v)
         if fp in fps: continue
         selected.append(v); ids.add(ident); fps.add(fp)
+    print('Diagnostics:',json.dumps(stats,ensure_ascii=False))
+    print('Exclusions:',json.dumps(counts,ensure_ascii=False))
     html=report(selected,counts)
     if os.environ.get('SEND_MAIL')!='1':
         print('Dry run: selected',len(selected),'exclusions',counts); return
