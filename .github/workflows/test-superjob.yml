@@ -1,0 +1,70 @@
+
+name: Test SuperJob API
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Test SuperJob vacancy search
+        env:
+          SUPERJOB_API_KEY: ${{ secrets.SUPERJOB_API_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+          import urllib.error
+          import sys
+
+          key = os.environ.get("SUPERJOB_API_KEY", "")
+
+          if not key:
+              sys.exit("ERROR: API key is missing")
+
+          params = urllib.parse.urlencode({
+              "keyword": "геодезист",
+              "count": 5,
+              "page": 0
+          })
+
+          url = (
+              "https://api.superjob.ru/2.0/vacancies/"
+              + "?" + params
+          )
+
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "X-Api-App-Id": key,
+                  "Accept": "application/json"
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(
+                  request, timeout=30
+              ) as response:
+                  status = response.status
+                  data = json.load(response)
+
+              print("HTTP status:", status)
+              print("Total vacancies:", data.get("total"))
+              print("Received:", len(data.get("objects", [])))
+              print("API connection successful")
+
+          except urllib.error.HTTPError as error:
+              sys.exit(f"HTTP error: {error.code}")
+
+          except Exception as error:
+              sys.exit(f"Request failed: {type(error).__name__}")
+          PY
