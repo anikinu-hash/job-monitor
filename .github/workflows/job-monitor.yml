@@ -1,0 +1,45 @@
+name: Job Monitor
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 10 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: job-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests
+        run: python3 -m unittest -v
+      - name: Get private history repository
+        if: vars.SEND_MAIL == '1'
+        uses: actions/checkout@v4
+        with:
+          repository: anikinu-hash/job-monitor-state
+          token: ${{ secrets.STATE_TOKEN }}
+          path: private-state
+      - name: Search and report
+        env:
+          SUPERJOB_API_KEY: ${{ secrets.SUPERJOB_API_KEY }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+          SEND_MAIL: ${{ vars.SEND_MAIL }}
+          STATE_FILE: private-state/history.json
+        run: python3 job_monitor.py
+      - name: Save private history
+        if: vars.SEND_MAIL == '1'
+        working-directory: private-state
+        run: |
+          git config user.name job-monitor
+          git config user.email job-monitor@users.noreply.github.com
+          git add history.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update private history'
+            git push
+          fi
