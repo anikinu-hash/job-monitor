@@ -22,7 +22,7 @@ def field(v,k):
     return str(x.get('title','') if isinstance(x,dict) else x)
 
 def api(path,params=None):
-    req=Request(API+path+('?' + urlencode(params,doseq=True) if params else ''),headers={'X-Api-App-Id':os.environ['SUPERJOB_API_KEY'],'Accept':'application/json','User-Agent':'JobMonitor/1.2'})
+    req=Request(API+path+('?' + urlencode(params,doseq=True) if params else ''),headers={'X-Api-App-Id':os.environ['SUPERJOB_API_KEY'],'Accept':'application/json','User-Agent':'JobMonitor/1.3'})
     for attempt in range(3):
         try:
             with urlopen(req,timeout=30) as r: return json.load(r)
@@ -32,7 +32,7 @@ def api(path,params=None):
 
 def classify(v,now):
     title=field(v,'profession'); duties=field(v,'work'); req=field(v,'candidat'); terms=field(v,'compensation'); schedule=field(v,'type_of_work'); town=field(v,'town'); address=field(v,'address'); body=' '.join((title,duties,req,terms,schedule,address))
-    if ROTATION.search(NEG_ROTATION.sub('',body)): return None,'rotation'
+    if str((v.get('type_of_work') or {}).get('id','') if isinstance(v.get('type_of_work'),dict) else '')=='9' or ROTATION.search(NEG_ROTATION.sub('',body)): return None,'rotation'
     if v.get('is_archive') or v.get('archive') or v.get('is_closed'): return None,'closed'
     try: age=now-int(v['date_published'])
     except (KeyError,ValueError,TypeError): return None,'date'
@@ -40,12 +40,10 @@ def classify(v,now):
     # Conservative: city alone is not proof of actual worksite.
     if OUTSIDE.search(body+' '+town): return None,'outside or ambiguous region'
     if not REGION.search(town): return None,'town unconfirmed'
-    if not REGION.search(address+' '+duties+' '+terms): return None,'worksite unconfirmed'
-    if address and not REGION.search(address) and not REGION.search(duties+' '+terms): return None,'worksite unconfirmed'
+    if not REGION.search(duties+' '+terms): return None,'worksite unconfirmed'
     if OTHER.search(body): return None,'travel unconfirmed'
-    if not re.search(r'полный рабочий день|5\s*[/–-]\s*2|пятиднев|без вахты',schedule+' '+terms,re.I): return None,'schedule unconfirmed'
-    if not re.search(r'геодез|лазерн.*сканирован|облак[ао] точек',title,re.I): return None,'irrelevant'
-    if not re.search(r'геодез|сканирован|облак',title,re.I): return None,'irrelevant'
+    if not re.search(r'полный (?:рабочий )?день|5\s*[/–-]\s*2|пятиднев|без вахты',schedule+' '+terms,re.I): return None,'schedule unconfirmed'
+    if not relevant(v): return None,'irrelevant'
     if re.search(r'главн\w* геодезист|руководител\w* геодез',title,re.I): rank=1
     elif re.search(r'техническ\w* заказчик|техзаказчик',title+' '+duties,re.I): rank=2
     elif re.search(r'ведущ|главн|контрол',title,re.I): rank=3
@@ -60,34 +58,43 @@ def fingerprint(v):
     def norm(s): return re.sub(r'\W+','',s.casefold())
     return hashlib.sha256('|'.join(norm(field(v,k)) for k in ('firm_name','profession','town','address')).encode()).hexdigest()
 
+def relevant(v):
+    title=field(v,'profession'); work=field(v,'work')
+    pattern=r'геодез|лазерн\w*\s+сканирован|облак\w*\s+точек'
+    return bool(re.search(pattern,title+' '+work,re.I))
+
 def regions():
-    data=api('regions/',{'count':100})
-    rows=data.get('objects')
-    if not isinstance(rows,list): raise RuntimeError('Region directory unavailable')
-    matches=[r for r in rows if field(r,'title').casefold().strip() in ('москва','московская область')]
-    if not any(field(r,'title').casefold().strip()=='московская область' for r in matches):
-        raise RuntimeError('Moscow region not verified in directory')
-    return [r['id'] for r in matches]
+    rows=api('regions/',{'keyword':'Московская область','all':1}).get('objects',[])
+    matches=[r for r in rows if field(r,'title').strip().casefold()=='московская область' and str(r.get('id_country'))=='1']
+    if len(matches)!=1: raise RuntimeError('Moscow region not verified')
+    return [matches[0]['id']]
+
+def moscow():
+    rows=api('towns/',{'keyword':'Москва','id_country':1,'all':1}).get('objects',[])
+    matches=[r for r in rows if field(r,'title').strip().casefold()=='москва' and str(r.get('id_country'))=='1']
+    if len(matches)!=1: raise RuntimeError('Moscow city not verified')
+    return matches[0]['id']
 
 def search():
     found={}
-    region_ids=regions()
-    print('Region directory IDs:',region_ids)
-    for q in QUERIES:
-        for page in range(10):
-            data=api('vacancies/',{'keyword':q,'count':100,'page':page,'o[]':region_ids})
-            rows=data.get('objects')
-            if not isinstance(rows,list): raise RuntimeError('Unexpected API response')
-            for v in rows:
-                if v.get('id'): found[str(v['id'])]=v
-            if not data.get('more'): break
-            if page==9: raise RuntimeError('Pagination limit reached; search incomplete')
+    region=regions()[0]; city=moscow()
+    print('Verified directory: Moscow city',city,'Moscow region',region)
+    for area,filters in [('Moscow',{'town':city}),('Moscow oblast',{'o[0]':region})]:
+        for q in QUERIES:
+            total_rows=0
+            for page in range(5):
+                data=api('vacancies/',{'keyword':q,'count':100,'page':page,'period':7,**filters})
+                rows=data.get('objects')
+                if not isinstance(rows,list): raise RuntimeError('Unexpected API response')
+                total_rows+=len(rows)
+                for v in rows:
+                    if v.get('id'): found[str(v['id'])]=v
+                if not data.get('more'): break
+                if page==4: raise RuntimeError('Pagination limit reached; search incomplete')
+            print('Query:',area,q,'rows:',total_rows,'API total:',data.get('total'))
     return found
 
 def preliminary(v,now):
-    title=field(v,'profession')
-    if title and not re.search(r'геодез|лазерн.*сканирован|облак[ао] точек',title,re.I): return 'irrelevant'
-    if ROTATION.search(NEG_ROTATION.sub('',field(v,'type_of_work'))): return 'rotation'
     if v.get('is_archive') or v.get('archive') or v.get('is_closed'): return 'closed'
     return None
 
@@ -107,6 +114,8 @@ def send(html):
 
 def main():
     state=Path(os.environ.get('STATE_FILE','history.json')); seen=json.loads(state.read_text()) if state.exists() else {'ids':[],'fingerprints':[]}; ids=set(seen['ids']); fps=set(seen['fingerprints']); counts={}; candidates=[]; review=[]; now=time.time()
+    from collections import Counter
+    diagnostic_titles=Counter()
     stats={'search_rows':0,'detail_rows':0,'town_present':0,'address_present':0,'local_town':0,'local_address':0,'schedule_present':0,'town_region_match':0,'local_town_without_local_address':0}
     for ident,summary in search().items():
         stats['search_rows']+=1
@@ -116,11 +125,13 @@ def main():
             counts[reason]=counts.get(reason,0)+1; continue
         try: v=api('vacancies/'+ident+'/')
         except RuntimeError as e:
-            if str(e)=='API HTTP 404':
+            if str(e) in ('API HTTP 404','API HTTP 410'):
                 counts['closed']=counts.get('closed',0)+1; continue
             raise
         if str(v.get('id'))!=ident: raise RuntimeError('Unexpected detail ID')
         stats['detail_rows']+=1
+        from collections import Counter
+        diagnostic_titles[field(v,'profession') or '(missing)'] += 1
         town=field(v,'town'); address=field(v,'address')
         for k,flag in [('town_present',bool(town)),('address_present',bool(address)),('local_town',bool(REGION.search(town))),('local_address',bool(REGION.search(address))),('schedule_present',bool(field(v,'type_of_work'))),('town_region_match',bool(REGION.search(field(v,'town')))),('local_town_without_local_address',bool(REGION.search(town)) and not bool(REGION.search(address)))]:
             stats[k]+=int(flag)
@@ -137,13 +148,14 @@ def main():
         fp=fingerprint(v)
         if fp in fps: continue
         selected.append(v); ids.add(ident); fps.add(fp)
+    print('Distinct titles:',len(diagnostic_titles),'title matches:',sum(n for t,n in diagnostic_titles.items() if relevant({'profession':t})))
     print('Diagnostics:',json.dumps(stats,ensure_ascii=False))
     print('Needs manual review (count only):',len(review))
     print('Exclusions:',json.dumps(counts,ensure_ascii=False))
     html=report(selected,counts)
     if os.environ.get('SEND_MAIL')!='1':
         print('Dry run: selected',len(selected),'exclusions',counts); return
-    raise RuntimeError('Version 1.2 diagnostic only: email disabled')
+    raise RuntimeError('Version 1.3 diagnostic only: email disabled')
     send(html)
     state.parent.mkdir(parents=True,exist_ok=True); tmp=state.with_suffix('.tmp'); tmp.write_text(json.dumps({'ids':sorted(ids),'fingerprints':sorted(fps)})); tmp.replace(state)
     print('Report sent; count:',len(selected))
