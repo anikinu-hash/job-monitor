@@ -13,6 +13,10 @@ jobs:
           persist-credentials: false
       - name: Tests
         run: python3 -m unittest -v
+      - name: API diagnostics
+        env:
+          SUPERJOB_API_KEY: ${{ secrets.SUPERJOB_API_KEY }}
+        run: python3 diagnostic.py
       - name: Search and report
         env:
           SUPERJOB_API_KEY: ${{ secrets.SUPERJOB_API_KEY }}
